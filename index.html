@@ -5788,11 +5788,11 @@
             const userMessageId = generateMessageId();
             
             // Debug conversation history for follow-up messages
-            console.log('=== FOLLOW-UP MESSAGE DEBUG ===');
+            console.log('=== CONVERSATION CONTEXT DEBUG ===');
             console.log('Current sessionId:', currentSessionId);
             console.log('ConversationHistory length:', conversationHistory.length);
-            console.log('ConversationHistory:', conversationHistory);
-            console.log('Message:', message);
+            console.log('Sending last 20 messages as context:', conversationHistory.slice(-20));
+            console.log('Current message:', message);
             console.log('=== END DEBUG ===');
             
             addMessage(message, 'user', Date.now(), userMessageId);
@@ -5816,7 +5816,7 @@
                         message: message,
                         sessionId: currentSessionId,
                         userId: currentUser.userId,
-                        history: conversationHistory.slice(-10),
+                        history: conversationHistory.slice(-20), // Increased context window
                         messageId: userMessageId,
                         language: currentLanguage,
                         model: selectedModel,
@@ -5842,7 +5842,7 @@
                                     message: message,
                                     sessionId: currentSessionId,
                                     userId: currentUser.userId,
-                                    history: conversationHistory.slice(-10),
+                                    history: conversationHistory.slice(-20), // Increased context window
                                     messageId: userMessageId,
                                     language: currentLanguage,
                                     model: selectedModel,
