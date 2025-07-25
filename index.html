@@ -115,6 +115,19 @@
             color: white;
         }
         
+        body.dark-theme .sidebar-footer {
+            border-top-color: #444;
+        }
+        
+        body.dark-theme .clear-all-btn {
+            background: #e74c3c;
+        }
+        
+        body.dark-theme .clear-all-btn:hover {
+            background: #c0392b;
+            box-shadow: 0 4px 8px rgba(231, 76, 60, 0.4);
+        }
+        
         body.dark-theme .sidebar-content {
             background: #1e1e1e;
         }
@@ -645,6 +658,21 @@
             width: 320px; background: rgba(255,255,255,0.95); border-right: 1px solid #e0e0e0;
             display: flex; flex-direction: column; backdrop-filter: blur(10px);
         }
+        .sidebar-footer {
+            padding: 15px 20px; border-top: 1px solid #e0e0e0; margin-top: auto;
+        }
+        .clear-all-btn {
+            width: 100%; padding: 12px; background: #dc3545; color: white;
+            border: none; border-radius: 8px; font-weight: 500; cursor: pointer;
+            transition: all 0.3s ease; font-size: 14px;
+        }
+        .clear-all-btn:hover {
+            background: #c82333; transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(220, 53, 69, 0.3);
+        }
+        .clear-all-btn:active {
+            transform: translateY(0);
+        }
         .sidebar-header {
             padding: 20px; background: linear-gradient(135deg, #0d7377 0%, #14a085 100%);
             color: white; display: flex; align-items: center; justify-content: space-between;
@@ -1170,6 +1198,11 @@
                     <div class="history-title" data-translate="older">Older</div>
                     <div id="olderChats"></div>
                 </div>
+                
+                <!-- Clear All History Button -->
+                <div class="sidebar-footer">
+                    <button class="clear-all-btn" id="clearAllHistoryBtn" data-translate="clear_all_history">🗑️ Clear All History</button>
+                </div>
             </div>
         </div>
 
@@ -1368,6 +1401,25 @@
         </div>
     </div>
 
+    <!-- Clear All History Confirmation Modal -->
+    <div class="feedback-modal" id="clearAllHistoryModal">
+        <div class="feedback-content">
+            <h3 class="feedback-header">⚠️ Clear All Chat History</h3>
+            <p style="margin-bottom: 20px; color: #666; line-height: 1.5;">
+                This will permanently delete ALL your chat conversations and cannot be undone. 
+                <br><br>
+                <strong>To confirm, type "delete me" below:</strong>
+            </p>
+            <input type="text" id="clearAllConfirmInput" class="feedback-textarea" 
+                   placeholder="Type 'delete me' to confirm..." 
+                   style="min-height: auto; padding: 12px 15px;" />
+            <div class="feedback-actions">
+                <button id="clearAllCancel" class="feedback-cancel">Cancel</button>
+                <button id="clearAllConfirm" class="feedback-submit" disabled>Clear All History</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         // API Configuration
         const API_ENDPOINT = '{{API_ENDPOINT}}';
@@ -1481,6 +1533,7 @@
                 input_placeholder: 'Type your message here or click the microphone to speak...',
                 mic_button_title: 'Click to start/stop voice input',
                 clear_chat: 'Clear Chat',
+                clear_all_history: '🗑️ Clear All History',
                 session_id: 'Session ID:',
                 feedback_title: 'Share your feedback',
                 feedback_good_title: 'Great! What did you like about this response?',
@@ -5440,6 +5493,12 @@
                 }
             });
             
+            // Clear all history button
+            const clearAllBtn = document.getElementById('clearAllHistoryBtn');
+            if (clearAllBtn) {
+                clearAllBtn.addEventListener('click', showClearAllHistoryModal);
+            }
+            
             // Ensure normal text input behavior for key repetition
             chatInput.addEventListener('keydown', function(e) {
                 // Allow all normal text input keys including key repetition
@@ -6048,6 +6107,100 @@
             document.getElementById('feedbackModal').classList.remove('show');
             document.getElementById('feedbackText').value = '';
             currentFeedbackData = null;
+        }
+        
+        // Clear All History Functions
+        function showClearAllHistoryModal() {
+            document.getElementById('clearAllHistoryModal').classList.add('show');
+            document.getElementById('clearAllConfirmInput').focus();
+            
+            // Setup modal event listeners
+            const modal = document.getElementById('clearAllHistoryModal');
+            const confirmInput = document.getElementById('clearAllConfirmInput');
+            const confirmBtn = document.getElementById('clearAllConfirm');
+            const cancelBtn = document.getElementById('clearAllCancel');
+            
+            // Enable/disable confirm button based on input
+            const checkInput = () => {
+                const isValid = confirmInput.value.toLowerCase() === 'delete me';
+                confirmBtn.disabled = !isValid;
+                confirmBtn.style.opacity = isValid ? '1' : '0.5';
+            };
+            
+            confirmInput.addEventListener('input', checkInput);
+            confirmInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter' && !confirmBtn.disabled) {
+                    clearAllChatHistory();
+                }
+            });
+            
+            confirmBtn.onclick = clearAllChatHistory;
+            cancelBtn.onclick = closeClearAllHistoryModal;
+            
+            // Close on background click
+            modal.onclick = (e) => {
+                if (e.target === modal) {
+                    closeClearAllHistoryModal();
+                }
+            };
+        }
+        
+        function closeClearAllHistoryModal() {
+            document.getElementById('clearAllHistoryModal').classList.remove('show');
+            document.getElementById('clearAllConfirmInput').value = '';
+            document.getElementById('clearAllConfirm').disabled = true;
+        }
+        
+        async function clearAllChatHistory() {
+            try {
+                // Show loading state
+                const confirmBtn = document.getElementById('clearAllConfirm');
+                confirmBtn.textContent = 'Clearing...';
+                confirmBtn.disabled = true;
+                
+                // Get all user sessions first
+                const response = await fetch(CHAT_HISTORY_ENDPOINT + '/sessions', {
+                    headers: { 'Authorization': 'Bearer ' + accessToken }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    const allSessions = [...data.sessions.today, ...data.sessions.thisWeek, ...data.sessions.older];
+                    
+                    // Delete each session
+                    const deletePromises = allSessions.map(session => 
+                        fetch(CHAT_HISTORY_ENDPOINT + '/sessions/' + session.sessionId, {
+                            method: 'DELETE',
+                            headers: { 'Authorization': 'Bearer ' + accessToken }
+                        })
+                    );
+                    
+                    await Promise.all(deletePromises);
+                    
+                    // Clear local storage and UI
+                    localStorage.removeItem('phoenix-current-session');
+                    conversationHistory = [];
+                    
+                    // Create new session
+                    createNewSession();
+                    
+                    // Refresh chat history display
+                    displayChatHistory({ today: [], thisWeek: [], older: [] });
+                    
+                    // Close modal and show success
+                    closeClearAllHistoryModal();
+                    showNotification('All chat history has been cleared successfully', 'success');
+                    
+                } else {
+                    throw new Error('Failed to fetch sessions');
+                }
+                
+            } catch (error) {
+                console.error('Error clearing all chat history:', error);
+                showNotification('Failed to clear chat history. Please try again.', 'error');
+                confirmBtn.textContent = 'Clear All History';
+                confirmBtn.disabled = false;
+            }
         }
         
         function showFeedbackConfirmation() {
