@@ -5444,71 +5444,55 @@
         }
         
         function formatMessageContent(content) {
-            // Escape HTML first
+            // Helper function for safe HTML escaping
             const escapeHtml = (text) => {
                 const div = document.createElement('div');
                 div.textContent = text;
                 return div.innerHTML;
             };
             
-            // Convert back to text to work with
+            // Start with the original content
             let processedContent = content;
             
-            // 1. Handle multi-line code blocks (```language)
-            processedContent = processedContent.replace(/```(\w+)?\n?([\s\S]*?)```/g, (match, language, code) => {
-                const trimmedCode = code.trim();
-                return formatCodeBlock(escapeHtml(trimmedCode), language);
-            });
-            
-            // 2. Handle single backtick inline code
-            processedContent = processedContent.replace(/`([^`]+)`/g, (match, code) => {
-                return `<span class="inline-code">${escapeHtml(code)}</span>`;
-            });
-            
-            // 3. Handle common code patterns without backticks
-            // Multi-line code blocks that look like code
-            processedContent = processedContent.replace(/\n((?:[ ]{4}|\t).+(?:\n(?:[ ]{4}|\t).+)*)/g, (match, code) => {
-                const cleanCode = code.replace(/^[ ]{4}|\t/gm, '').trim();
-                if (cleanCode.length > 10) { // Only if substantial
-                    return '\n' + formatCodeBlock(escapeHtml(cleanCode));
-                }
-                return match;
-            });
-            
-            // 4. Detect code-like lines (function definitions, imports, etc.)
-            const codePatterns = [
-                /^(function|def|class|import|from|#include|public class|private class|\$|&gt;|curl|git)/im,
-                /^[a-zA-Z_$][a-zA-Z0-9_$]*\s*\([^)]*\)\s*[{:]?\s*$/gm, // Function signatures
-                /^[a-zA-Z_$][a-zA-Z0-9_$]*\s*=\s*.+[;}]?\s*$/gm, // Variable assignments
-            ];
-            
-            // Format detected code patterns
-            processedContent = processedContent.replace(/\n([^\n]+(?:\n[^\n]+){0,10})/g, (match, block) => {
-                if (codePatterns.some(pattern => pattern.test(block))) {
-                    const lines = block.split('\n');
-                    if (lines.length >= 2) { // Multi-line code
-                        return '\n' + formatCodeBlock(escapeHtml(block.trim()));
+            // Only process if the content doesn't already contain code blocks
+            if (!processedContent.includes('<div class="code-block">')) {
+                
+                // 1. Handle multi-line code blocks (```language)
+                processedContent = processedContent.replace(/```(\w+)?\n?([\s\S]*?)```/g, (match, language, code) => {
+                    const trimmedCode = code.trim();
+                    return formatCodeBlock(escapeHtml(trimmedCode), language);
+                });
+                
+                // 2. Handle single backtick inline code
+                processedContent = processedContent.replace(/`([^`]+)`/g, (match, code) => {
+                    return `<span class="inline-code">${escapeHtml(code)}</span>`;
+                });
+                
+                // 3. Format remaining content: convert double line breaks to paragraphs, single to <br>
+                const parts = processedContent.split(/(<div class="code-block">[\s\S]*?<\/div>|<span class="inline-code">[\s\S]*?<\/span>)/);
+                
+                return parts.map(part => {
+                    if (part.includes('code-block') || part.includes('inline-code')) {
+                        return part; // Keep code as-is
+                    } else {
+                        // Format regular text content
+                        return part
+                            .split(/\n\n+/)
+                            .map(paragraph => paragraph.trim())
+                            .filter(paragraph => paragraph)
+                            .map(paragraph => `<p style="margin: 0 0 1em 0;">${paragraph.replace(/\n/g, '<br>')}</p>`)
+                            .join('');
                     }
-                }
-                return match;
-            });
-            
-            // 5. Format remaining content: convert double line breaks to paragraphs, single to <br>
-            const parts = processedContent.split(/(<div class="code-block">[\s\S]*?<\/div>)/);
-            
-            return parts.map(part => {
-                if (part.includes('code-block')) {
-                    return part; // Keep code blocks as-is
-                } else {
-                    // Format regular text content
-                    return part
-                        .split(/\n\n+/)
-                        .map(paragraph => paragraph.trim())
-                        .filter(paragraph => paragraph)
-                        .map(paragraph => `<p style="margin: 0 0 1em 0;">${paragraph.replace(/\n/g, '<br>')}</p>`)
-                        .join('');
-                }
-            }).join('');
+                }).join('');
+            } else {
+                // Content already has code blocks, just format the text parts
+                return processedContent
+                    .split(/\n\n+/)
+                    .map(paragraph => paragraph.trim())
+                    .filter(paragraph => paragraph)
+                    .map(paragraph => `<p style="margin: 0 0 1em 0;">${paragraph.replace(/\n/g, '<br>')}</p>`)
+                    .join('');
+            }
         }
         
         // Streaming Response Functions
