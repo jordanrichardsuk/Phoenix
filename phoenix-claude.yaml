@@ -1,0 +1,3241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Phoenix Chatbot - Complete RAG-enabled AI Assistant with Admin Console, Adaptive Model Selection (Sonnet/Haiku), Voice Input, Feedback System, and UEL Branding'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'staging'
+    AllowedValues: ['dev', 'test', 'staging', 'prod']
+    Description: Environment name
+  
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain name (optional)
+  
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: SSL Certificate ARN for custom domain (optional)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref DomainName, '']]
+
+Resources:
+  # S3 Bucket for Knowledge Base Documents
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 
+        - 'phoenix-kb-${Environment}-${AWS::AccountId}-${RandomString}'
+        - RandomString: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket for Frontend Hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub 
+        - 'phoenix-fe-${Environment}-${AWS::AccountId}-${RandomString}'
+        - RandomString: !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'HEAD']
+            AllowedOrigins: ['*']
+            MaxAge: 3600
+
+  # S3 Bucket Policy for Public Read Access
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # IAM Role for Bedrock Knowledge Base
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KnowledgeBaseS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseBucket.Arn
+                  - !Sub '${KnowledgeBaseBucket.Arn}/*'
+        - PolicyName: BedrockEmbeddingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1'
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !Sub '${FrontendBucket}.s3-website-${AWS::Region}.amazonaws.com'
+            Id: S3Origin
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+          DefaultTTL: 300
+          MinTTL: 0
+          MaxTTL: 31536000
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        PriceClass: PriceClass_100
+        Aliases: !If 
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-5-sonnet-20240620-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: 
+                  - !GetAtt ConversationTable.Arn
+                  - !GetAtt UserSessionsTable.Arn
+                  - !GetAtt GoodFeedbackTable.Arn
+                  - !GetAtt BadFeedbackTable.Arn
+                  - !Sub '${ConversationTable.Arn}/index/*'
+                  - !Sub '${UserSessionsTable.Arn}/index/*'
+        - PolicyName: CognitoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminInitiateAuth
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminConfirmSignUp
+                  - cognito-idp:AdminRespondToAuthChallenge
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:ConfirmForgotPassword
+                  - cognito-idp:ForgotPassword
+                  - cognito-idp:GetUser
+                  - cognito-idp:InitiateAuth
+                  - cognito-idp:RespondToAuthChallenge
+                  - cognito-idp:SignUp
+                  - cognito-idp:ConfirmSignUp
+                Resource: !GetAtt UserPool.Arn
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # DynamoDB Table for Conversation History
+  ConversationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'phoenix-conversations-${Environment}-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB Table for User Sessions (Chat History Sidebar)
+  UserSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'phoenix-user-sessions-${Environment}-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: sessionId
+          AttributeType: S
+        - AttributeName: lastActivity
+          AttributeType: N
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: sessionId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: LastActivityIndex
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: lastActivity
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB Table for Good Feedback
+  GoodFeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'phoenix-good-feedback-${Environment}-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: feedbackId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: feedbackId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB Table for Bad Feedback
+  BadFeedbackTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'phoenix-bad-feedback-${Environment}-${AWS::StackName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: feedbackId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: feedbackId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Cognito User Pool for Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'phoenix-users-${Environment}-${AWS::StackName}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: given_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      UserPoolTags:
+        Environment: !Ref Environment
+        Application: Phoenix
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'phoenix-client-${Environment}-${AWS::StackName}'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
+      LogoutURLs:
+        - !Sub 'https://${CloudFrontDistribution.DomainName}/logout'
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+
+  # Cognito Identity Pool
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub 'phoenix_identity_pool_${Environment}_${AWS::StackName}'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # IAM Role for authenticated users
+  CognitoAuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: CognitoAuthenticatedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:Invoke
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  # Attach roles to identity pool
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthenticatedRole.Arn
+
+  # IAM Role for Deployment Lambda
+  DeploymentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # Lambda Function for creating error page only
+  DeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-deploy-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt DeploymentLambdaRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+          
+          http = urllib3.PoolManager()
+          
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False, reason=None):
+              responseUrl = event['ResponseURL']
+              responseBody = {
+                  'Status': responseStatus,
+                  'Reason': reason or ('See the details in CloudWatch Log Stream: ' + context.log_stream_name),
+                  'PhysicalResourceId': physicalResourceId or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': noEcho,
+                  'Data': responseData
+              }
+              json_responseBody = json.dumps(responseBody)
+              headers = {'content-type': '', 'content-length': str(len(json_responseBody))}
+              try:
+                  response = http.request('PUT', responseUrl, headers=headers, body=json_responseBody)
+                  print("Status code: " + response.status)
+              except Exception as e:
+                  print("send(..) failed executing http.request(..):", e)
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  if event['RequestType'] == 'Delete':
+                      send(event, context, 'SUCCESS', {})
+                      return
+                  
+                  # Create error.html
+                  error_html = """<!DOCTYPE html>
+          <html>
+          <head>
+              <title>Phoenix - Page Not Found | University of East London</title>
+              <style>
+                  body {
+                      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                      background: linear-gradient(135deg, #0d7377 0%, #14a085 100%);
+                      color: white; display: flex; justify-content: center; align-items: center;
+                      height: 100vh; margin: 0; text-align: center;
+                  }
+                  .container {
+                      background: rgba(255,255,255,0.1); padding: 40px; border-radius: 20px;
+                      backdrop-filter: blur(10px);
+                  }
+                  h1 { font-size: 48px; margin-bottom: 20px; }
+                  p { font-size: 18px; margin-bottom: 30px; }
+                  a {
+                      color: white; text-decoration: none; background: rgba(255,255,255,0.2);
+                      padding: 12px 24px; border-radius: 25px; transition: all 0.3s;
+                  }
+                  a:hover { background: rgba(255,255,255,0.3); }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>404</h1>
+                  <p>Oops! The page you're looking for doesn't exist.</p>
+                  <a href="/">Return to Phoenix</a>
+              </div>
+          </body>
+          </html>"""
+                  
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key='error.html',
+                      Body=error_html,
+                      ContentType='text/html'
+                  )
+                  
+                  send(event, context, 'SUCCESS', {'Message': 'Error page deployed successfully'})
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send(event, context, 'FAILED', {'Error': str(e)})
+
+  # Enhanced Lambda Function for Chat API with RAG
+  ChatFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-chat-rag-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+          USER_SESSIONS_TABLE: !Ref UserSessionsTable
+          ENVIRONMENT: !Ref Environment
+          # Knowledge Base ID will be set manually after KB creation
+          # KNOWLEDGE_BASE_ID: 'YOUR_KB_ID_HERE'
+          # Admin Console Features: Supports adaptive model selection between Sonnet/Haiku
+          # RAG can be toggled on/off via Admin Console
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          from decimal import Decimal
+          from datetime import datetime, timezone
+          from botocore.exceptions import ClientError
+          from boto3.dynamodb.conditions import Key
+          
+          bedrock = boto3.client('bedrock-runtime')
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+          cognito = boto3.client('cognito-idp')
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+          table = dynamodb.Table(os.environ['CONVERSATION_TABLE'])
+          user_sessions_table = dynamodb.Table(os.environ['USER_SESSIONS_TABLE'])
+          
+          # Bedrock pricing (update with current rates)
+          BEDROCK_PRICING = {
+              'anthropic.claude-3-5-sonnet-20240620-v1:0': {
+                  'input': 0.003 / 1000,   # $0.003 per 1K input tokens
+                  'output': 0.015 / 1000   # $0.015 per 1K output tokens
+              },
+              'anthropic.claude-3-haiku-20240307-v1:0': {
+                  'input': 0.00025 / 1000, # $0.00025 per 1K input tokens
+                  'output': 0.00125 / 1000 # $0.00125 per 1K output tokens
+              }
+          }
+          
+          def send_business_metrics(metrics_data):
+              """Send business metrics to CloudWatch"""
+              try:
+                  if not metrics_data:
+                      return
+                  
+                  metric_data = []
+                  for metric in metrics_data:
+                      metric_entry = {
+                          'MetricName': metric['name'],
+                          'Value': metric['value'],
+                          'Unit': metric.get('unit', 'Count'),
+                          'Timestamp': datetime.now(timezone.utc)
+                      }
+                      
+                      if metric.get('dimensions'):
+                          metric_entry['Dimensions'] = metric['dimensions']
+                      
+                      metric_data.append(metric_entry)
+                  
+                  # Send metrics in batches of 20 (CloudWatch limit)
+                  for i in range(0, len(metric_data), 20):
+                      batch = metric_data[i:i+20]
+                      cloudwatch.put_metric_data(
+                          Namespace='Phoenix/Business',
+                          MetricData=batch
+                      )
+                      
+                  print(f"Successfully sent {len(metric_data)} business metrics")
+                  
+              except Exception as e:
+                  print(f"Failed to send business metrics: {e}")
+                  # Don't fail the main function if metrics fail
+          
+          def calculate_bedrock_cost(model_id, input_tokens, output_tokens):
+              """Calculate cost for Bedrock API call"""
+              if model_id not in BEDROCK_PRICING:
+                  return 0
+              
+              pricing = BEDROCK_PRICING[model_id]
+              input_cost = input_tokens * pricing['input']
+              output_cost = output_tokens * pricing['output']
+              return input_cost + output_cost
+          
+          def estimate_tokens(text):
+              """Rough estimate of token count (1 token ≈ 4 characters for Claude)"""
+              return max(1, len(text) // 4)
+          
+          # Set this after creating Knowledge Base
+          KNOWLEDGE_BASE_ID = os.environ.get('KNOWLEDGE_BASE_ID', '')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Start timing the request
+                  start_time = time.time()
+                  
+                  headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  }
+                  
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'OK'})
+                      }
+                  
+                  # Extract user ID from JWT token
+                  user_id = get_user_id_from_token(event)
+                  if not user_id:
+                      return {
+                          'statusCode': 401,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Unauthorized'})
+                      }
+                  
+                  body = json.loads(event['body'])
+                  message = body.get('message', '')
+                  session_id = body.get('sessionId', str(uuid.uuid4()))
+                  conversation_history = body.get('history', [])
+                  message_id = body.get('messageId', str(uuid.uuid4()))
+                  user_language = body.get('language', 'en')
+                  
+                  # Extract admin settings
+                  selected_model = body.get('model', 'sonnet')
+                  rag_enabled = body.get('ragEnabled', True)
+                  streaming_enabled = body.get('streamingEnabled', True)
+                  admin_settings = body.get('adminSettings', {})
+                  
+                  print(f"Request settings - Model: {selected_model}, RAG: {rag_enabled}, Streaming: {streaming_enabled}")
+                  
+                  # Step 1: Query Knowledge Base if available and enabled
+                  rag_context = ""
+                  rag_sources = []
+                  
+                  if KNOWLEDGE_BASE_ID and rag_enabled:
+                      try:
+                          kb_response = bedrock_agent.retrieve(
+                              knowledgeBaseId=KNOWLEDGE_BASE_ID,
+                              retrievalQuery={
+                                  'text': message
+                              },
+                              retrievalConfiguration={
+                                  'vectorSearchConfiguration': {
+                                      'numberOfResults': 5,
+                                      'overrideSearchType': 'HYBRID'
+                                  }
+                              }
+                          )
+                          
+                          # Extract relevant information from KB results
+                          if 'retrievalResults' in kb_response:
+                              for result in kb_response['retrievalResults']:
+                                  content = result.get('content', {}).get('text', '')
+                                  if content:
+                                      rag_context += f"\n{content}"
+                                      
+                                  # Track sources
+                                  location = result.get('location', {})
+                                  if location:
+                                      source_info = {
+                                          'uri': location.get('s3Location', {}).get('uri', ''),
+                                          'score': result.get('score', 0)
+                                      }
+                                      if source_info['uri']:
+                                          rag_sources.append(source_info)
+                          
+                          print(f"Retrieved {len(rag_sources)} sources from Knowledge Base")
+                          
+                      except Exception as e:
+                          print(f"Error querying Knowledge Base: {str(e)}")
+                          # Continue without RAG if KB query fails
+                  
+                  # Step 2: Build conversation context with proper role alternation
+                  messages = []
+                  valid_history = []
+                  
+                  # Clean conversation history - ensure alternating roles and non-empty content
+                  for msg in conversation_history[-8:]:  # Reduced to leave room for RAG context
+                      role = msg.get('role', 'user')
+                      content = msg.get('content', '').strip()
+                      
+                      # Skip empty messages
+                      if not content:
+                          continue
+                          
+                      # Ensure role alternation
+                      if not valid_history or valid_history[-1]['role'] != role:
+                          valid_history.append({
+                              "role": role,
+                              "content": content
+                          })
+                  
+                  # Build final messages array
+                  for msg in valid_history:
+                      messages.append({
+                          "role": msg["role"],
+                          "content": msg["content"]
+                      })
+                  
+                  # Step 3: Create enhanced system prompt with RAG context
+                  language_names = {
+                      'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German', 'it': 'Italian', 
+                      'pt': 'Portuguese', 'nl': 'Dutch', 'pl': 'Polish', 'ru': 'Russian', 'ja': 'Japanese', 
+                      'ko': 'Korean', 'zh': 'Chinese', 'ar': 'Arabic', 'hi': 'Hindi', 'tr': 'Turkish',
+                      'sv': 'Swedish', 'da': 'Danish', 'no': 'Norwegian', 'fi': 'Finnish', 'cs': 'Czech',
+                      'hu': 'Hungarian', 'ro': 'Romanian', 'bg': 'Bulgarian', 'hr': 'Croatian', 'sk': 'Slovak',
+                      'sl': 'Slovenian', 'et': 'Estonian', 'lv': 'Latvian', 'lt': 'Lithuanian', 'uk': 'Ukrainian',
+                      'th': 'Thai', 'vi': 'Vietnamese', 'id': 'Indonesian', 'ms': 'Malay', 'he': 'Hebrew',
+                      'fa': 'Persian', 'ur': 'Urdu', 'bn': 'Bengali', 'ta': 'Tamil', 'te': 'Telugu',
+                      'mr': 'Marathi', 'gu': 'Gujarati', 'kn': 'Kannada', 'ml': 'Malayalam', 'pa': 'Punjabi',
+                      'or': 'Odia', 'as': 'Assamese', 'ne': 'Nepali', 'si': 'Sinhala', 'my': 'Burmese',
+                      'km': 'Khmer', 'lo': 'Lao', 'ka': 'Georgian', 'hy': 'Armenian', 'az': 'Azerbaijani',
+                      'kk': 'Kazakh', 'ky': 'Kyrgyz', 'uz': 'Uzbek', 'tg': 'Tajik', 'mn': 'Mongolian',
+                      'sw': 'Swahili', 'am': 'Amharic', 'yo': 'Yoruba', 'zu': 'Zulu', 'af': 'Afrikaans',
+                      'is': 'Icelandic', 'mt': 'Maltese', 'ga': 'Irish', 'cy': 'Welsh', 'eu': 'Basque',
+                      'ca': 'Catalan', 'gl': 'Galician'
+                  }
+                  
+                  language_name = language_names.get(user_language, 'English')
+                  
+                  system_prompt = f"""You are Phoenix, an AI assistant created for the University of East London. Be conversational, friendly, and provide accurate information. You can help with academic questions, university information, and general assistance. Users can interact with you via text or voice input.
+                  
+                  IMPORTANT: The user has selected {language_name} as their preferred language. You MUST respond in {language_name}. If the user writes in English but has selected {language_name}, respond in {language_name}. Always match the user's selected language preference, not the language they write in."""
+                  
+                  if rag_context.strip():
+                      system_prompt += f"""
+          
+          I have access to relevant information from the university's knowledge base that may help answer the user's question:
+          
+          {rag_context.strip()}
+          
+          Please use this information when relevant to provide more accurate and specific answers. If the knowledge base information directly addresses the user's question, prioritize it in your response. Always be honest about what information comes from the knowledge base versus your general knowledge."""
+                  
+                  # Add user message
+                  messages.append({
+                      "role": "user",
+                      "content": message
+                  })
+                  
+                  print(f"Final messages array has {len(messages)} messages")
+                  for i, msg in enumerate(messages):
+                      print(f"Message {i}: role={msg['role']}, content_length={len(msg['content'])}")
+                  
+                  # Step 4: Call Bedrock Claude with enhanced context and selected model
+                  # Map frontend model names to AWS Bedrock model IDs
+                  model_mapping = {
+                      'sonnet': 'anthropic.claude-3-5-sonnet-20240620-v1:0',
+                      'haiku': 'anthropic.claude-3-haiku-20240307-v1:0'  # Note: Check if this model is available in your region
+                  }
+                  
+                  # Get the actual model ID, default to Sonnet if invalid selection
+                  bedrock_model_id = model_mapping.get(selected_model, model_mapping['sonnet'])
+                  print(f"Using Bedrock model: {bedrock_model_id}, streaming: {streaming_enabled}")
+                  
+                  # Adjust max_tokens based on model (Haiku is faster, may need fewer tokens)
+                  max_tokens = 2000 if selected_model == 'sonnet' else 1500
+                  temperature = 0.7 if selected_model == 'sonnet' else 0.8  # Slightly higher for Haiku
+                  
+                  request_body = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": max_tokens,
+                      "temperature": temperature,
+                      "messages": messages,
+                      "system": system_prompt
+                  }
+                  
+                  try:
+                      # Temporarily disable streaming for Haiku to test
+                      if streaming_enabled and selected_model != 'haiku':
+                          # Use streaming API
+                          print(f"Attempting to call streaming API with model: {bedrock_model_id}")
+                          response = bedrock.invoke_model_with_response_stream(
+                              modelId=bedrock_model_id,
+                              body=json.dumps(request_body),
+                              contentType='application/json'
+                          )
+                          
+                          # Process streaming response
+                          ai_response = ""
+                          stream_chunks = []
+                          
+                          for event in response.get('body'):
+                              try:
+                                  chunk = json.loads(event['chunk']['bytes'])
+                                  print(f"Streaming chunk: {chunk}")  # Debug chunk structure
+                                  
+                                  if chunk.get('type') == 'content_block_delta':
+                                      chunk_text = chunk.get('delta', {}).get('text', '')
+                                      ai_response += chunk_text
+                                      stream_chunks.append({
+                                          'text': chunk_text,
+                                          'timestamp': int(time.time() * 1000)
+                                      })
+                                  elif chunk.get('type') == 'content_block_start':
+                                      print("Content block started")
+                                  elif chunk.get('type') == 'content_block_stop':
+                                      print("Content block ended")
+                                  elif chunk.get('type') == 'message_delta':
+                                      print("Message delta received")
+                                  elif chunk.get('type') == 'message_stop':
+                                      print("Message completed")
+                              except Exception as chunk_error:
+                                  print(f"Error processing chunk: {chunk_error}")
+                                  print(f"Raw event: {event}")
+                                  continue
+                      else:
+                          # Use regular API
+                          print(f"Attempting to call regular API with model: {bedrock_model_id}")
+                          response = bedrock.invoke_model(
+                              modelId=bedrock_model_id,
+                              body=json.dumps(request_body),
+                              contentType='application/json'
+                          )
+                          
+                          response_body = json.loads(response['body'].read())
+                          ai_response = response_body['content'][0]['text']
+                          stream_chunks = []
+                          
+                      if not ai_response or len(ai_response.strip()) == 0:
+                          raise Exception(f"Empty response from {bedrock_model_id}")
+                      
+                      print(f"Successfully got response from {bedrock_model_id}: {len(ai_response)} characters")
+                      
+                  except Exception as model_error:
+                      print(f"Error calling Bedrock model {bedrock_model_id}: {str(model_error)}")
+                      
+                      # Fallback to Sonnet if Haiku fails
+                      if selected_model == 'haiku':
+                          print("Haiku failed, falling back to Sonnet")
+                          bedrock_model_id = model_mapping['sonnet']
+                          
+                          response = bedrock.invoke_model(
+                              modelId=bedrock_model_id,
+                              body=json.dumps(request_body),
+                              contentType='application/json'
+                          )
+                          
+                          response_body = json.loads(response['body'].read())
+                          ai_response = response_body['content'][0]['text']
+                          stream_chunks = []
+                      else:
+                          raise model_error
+                  
+                  # Step 5: Save conversation to DynamoDB
+                  timestamp = int(time.time())
+                  ttl = timestamp + (7 * 24 * 60 * 60)  # 7 days TTL
+                  
+                  # Save user message
+                  table.put_item(
+                      Item={
+                          'sessionId': session_id,
+                          'timestamp': timestamp,
+                          'userId': user_id,
+                          'role': 'user',
+                          'content': message,
+                          'messageId': message_id,
+                          'ttl': ttl
+                      }
+                  )
+                  
+                  # Save AI response with RAG metadata and model info
+                  ai_message_id = str(uuid.uuid4())
+                  ai_item = {
+                      'sessionId': session_id,
+                      'timestamp': timestamp + 1,
+                      'userId': user_id,
+                      'role': 'assistant',
+                      'content': ai_response,
+                      'messageId': ai_message_id,
+                      'ttl': ttl,
+                      'modelUsed': selected_model,
+                      'ragUsed': bool(rag_sources)
+                  }
+                  
+                  # Add RAG metadata if available
+                  if rag_sources:
+                      ai_item['ragSources'] = json.dumps(rag_sources)
+                      ai_item['ragEnabled'] = True
+                  
+                  table.put_item(Item=ai_item)
+                  
+                  # Step 5b: Update or create session in UserSessionsTable
+                  try:
+                      # Get first user message for title if this is a new session
+                      first_message_response = table.query(
+                          KeyConditionExpression=Key('sessionId').eq(session_id),
+                          ScanIndexForward=True,
+                          Limit=2  # Get first couple messages to find user message
+                      )
+                      
+                      title = 'New Conversation'
+                      for item in first_message_response.get('Items', []):
+                          if item.get('role') == 'user':
+                              title = item['content'][:100] + ('...' if len(item['content']) > 100 else '')
+                              break
+                      
+                      # Try to update existing session
+                      try:
+                          user_sessions_table.update_item(
+                              Key={'userId': user_id, 'sessionId': session_id},
+                              UpdateExpression='SET lastActivity = :activity, messageCount = :count, preview = :preview, title = :title',
+                              ExpressionAttributeValues={
+                                  ':activity': timestamp,
+                                  ':count': len(conversation_history) + 2,  # Include new messages
+                                  ':preview': message[:50] + ('...' if len(message) > 50 else ''),
+                                  ':title': title
+                              },
+                              ConditionExpression='attribute_exists(userId)'
+                          )
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'ConditionalCheckFailedException':
+                              # Session doesn't exist, create it
+                              user_sessions_table.put_item(
+                                  Item={
+                                      'userId': user_id,
+                                      'sessionId': session_id,
+                                      'title': title,
+                                      'lastActivity': timestamp,
+                                      'messageCount': 2,  # User message + AI response
+                                      'preview': message[:50] + ('...' if len(message) > 50 else ''),
+                                      'createdAt': timestamp,
+                                      'ttl': timestamp + (365 * 24 * 60 * 60)  # 1 year TTL
+                                  }
+                              )
+                  except Exception as e:
+                      print(f"Error updating session: {str(e)}")
+                      # Don't fail the main request if session update fails
+                  
+                  # Step 6: Calculate metrics
+                  response_time = time.time() - start_time
+                  input_tokens = estimate_tokens(message + system_prompt)
+                  output_tokens = estimate_tokens(ai_response)
+                  total_tokens = input_tokens + output_tokens
+                  cost = calculate_bedrock_cost(bedrock_model_id, input_tokens, output_tokens)
+                  
+                  # Determine model type for simpler tracking
+                  model_type = "sonnet" if "sonnet" in selected_model else "haiku"
+                  environment = os.environ.get('ENVIRONMENT', 'dev')
+                  
+                  # Prepare business metrics
+                  metrics = [
+                      # Core business metrics (no dimensions for dashboard simplicity)
+                      {
+                          'name': 'TotalQueries',
+                          'value': 1
+                      },
+                      {
+                          'name': 'QueriesPerHour', 
+                          'value': 1
+                      },
+                      {
+                          'name': 'ActiveUsers',
+                          'value': 1
+                      },
+                      # Detailed metrics with dimensions
+                      {
+                          'name': 'TotalQueries',
+                          'value': 1,
+                          'dimensions': [
+                              {'Name': 'Environment', 'Value': environment},
+                              {'Name': 'ModelType', 'Value': model_type}
+                          ]
+                      },
+                      # Token usage metrics
+                      {
+                          'name': 'TokensUsed',
+                          'value': total_tokens,
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type},
+                              {'Name': 'TokenType', 'Value': 'total'}
+                          ]
+                      },
+                      {
+                          'name': 'TokensUsed',
+                          'value': input_tokens,
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type},
+                              {'Name': 'TokenType', 'Value': 'input'}
+                          ]
+                      },
+                      {
+                          'name': 'TokensUsed',
+                          'value': output_tokens,
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type},
+                              {'Name': 'TokenType', 'Value': 'output'}
+                          ]
+                      },
+                      # Basic cost metrics (no dimensions)
+                      {
+                          'name': 'BedrockCost',
+                          'value': cost,
+                          'unit': 'None'  # Represents USD
+                      },
+                      # Detailed cost metrics (with dimensions)
+                      {
+                          'name': 'BedrockCost',
+                          'value': cost,
+                          'unit': 'None',  # Represents USD
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type}
+                          ]
+                      },
+                      # Performance metrics
+                      {
+                          'name': 'ResponseTime',
+                          'value': response_time,
+                          'unit': 'Seconds',
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type}
+                          ]
+                      },
+                      # Model usage tracking
+                      {
+                          'name': 'ModelUsage',
+                          'value': 1,
+                          'dimensions': [
+                              {'Name': 'Model', 'Value': model_type}
+                          ]
+                      }
+                  ]
+                  
+                  # Add RAG usage metrics if RAG was used
+                  if rag_sources:
+                      metrics.append({
+                          'name': 'RAGUsage',
+                          'value': 1,
+                          'dimensions': [
+                              {'Name': 'ModelType', 'Value': model_type}
+                          ]
+                      })
+                  
+                  # Send metrics asynchronously (don't block response)
+                  send_business_metrics(metrics)
+                  
+                  print(f"Metrics: Tokens={total_tokens}, Cost=${cost:.6f}, Time={response_time:.2f}s, Model={model_type}, RAG={bool(rag_sources)}")
+                  
+                  # Step 7: Prepare response
+                  response_data = {
+                      'response': ai_response,
+                      'sessionId': session_id,
+                      'messageId': ai_message_id,
+                      'modelUsed': selected_model,
+                      'modelId': bedrock_model_id,
+                      'ragEnabled': bool(rag_sources),
+                      'streaming': streaming_enabled,
+                      'metrics': {
+                          'tokensUsed': total_tokens,
+                          'inputTokens': input_tokens,
+                          'outputTokens': output_tokens,
+                          'cost': round(cost, 6),
+                          'responseTime': round(response_time, 2)
+                      },
+                      'adminSettings': {
+                          'ragEnabled': rag_enabled,
+                          'streamingEnabled': streaming_enabled,
+                          'modelSelected': selected_model
+                      }
+                  }
+                  
+                  # Include streaming chunks if available
+                  if streaming_enabled and stream_chunks:
+                      response_data['streamChunks'] = stream_chunks
+                      response_data['totalChunks'] = len(stream_chunks)
+                  
+                  # Include RAG information in response for debugging/analytics
+                  if rag_sources:
+                      response_data['ragSources'] = len(rag_sources)
+                      response_data['ragSourcesList'] = rag_sources[:3]  # Return max 3 sources for frontend display
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps(response_data)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  
+                  # Track error metrics
+                  try:
+                      error_metrics = [{
+                          'name': 'QueryErrors',
+                          'value': 1,
+                          'dimensions': [
+                              {'Name': 'ErrorType', 'Value': type(e).__name__},
+                              {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'dev')}
+                          ]
+                      }]
+                      send_business_metrics(error_metrics)
+                  except:
+                      pass  # Don't fail on metrics
+                  
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+          
+          def get_user_id_from_token(event):
+              try:
+                  # API Gateway may use different case for headers
+                  event_headers = event.get('headers', {})
+                  auth_header = (event_headers.get('Authorization', '') or 
+                               event_headers.get('authorization', ''))
+                  if not auth_header.startswith('Bearer '):
+                      return None
+                  
+                  access_token = auth_header.split(' ')[1]
+                  user_info = cognito.get_user(AccessToken=access_token)
+                  # Extract user_id from UserAttributes
+                  for attr in user_info.get('UserAttributes', []):
+                      if attr['Name'] == 'sub':
+                          return attr['Value']
+                  return user_info.get('Username', None)
+              except:
+                  return None
+
+  # Lambda Function for Getting Conversation History
+  HistoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-history-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from boto3.dynamodb.conditions import Key
+          
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['CONVERSATION_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  }
+                  
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'OK'})
+                      }
+                  
+                  session_id = event['pathParameters']['sessionId']
+                  
+                  response = table.query(
+                      KeyConditionExpression=Key('sessionId').eq(session_id),
+                      ScanIndexForward=True
+                  )
+                  
+                  messages = []
+                  for item in response['Items']:
+                      message_data = {
+                          'role': item['role'],
+                          'content': item['content'],
+                          'timestamp': int(item['timestamp']),
+                          'messageId': item.get('messageId', '')
+                      }
+                      
+                      # Include RAG metadata if available
+                      if item.get('ragEnabled'):
+                          message_data['ragEnabled'] = True
+                          if 'ragSources' in item:
+                              message_data['ragSources'] = json.loads(item['ragSources'])
+                      
+                      messages.append(message_data)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'history': messages})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # Lambda Function for Feedback API
+  FeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-feedback-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          GOOD_FEEDBACK_TABLE: !Ref GoodFeedbackTable
+          BAD_FEEDBACK_TABLE: !Ref BadFeedbackTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          from datetime import datetime, timezone
+          
+          dynamodb = boto3.resource('dynamodb')
+          cloudwatch = boto3.client('cloudwatch')
+          good_feedback_table = dynamodb.Table(os.environ['GOOD_FEEDBACK_TABLE'])
+          bad_feedback_table = dynamodb.Table(os.environ['BAD_FEEDBACK_TABLE'])
+          
+          def send_feedback_metrics(feedback_type):
+              """Send feedback metrics to CloudWatch"""
+              try:
+                  rating = 'positive' if feedback_type == 'good' else 'negative'
+                  
+                  metrics = [{
+                      'MetricName': 'UserSatisfaction',
+                      'Value': 1,
+                      'Unit': 'Count',
+                      'Timestamp': datetime.now(timezone.utc),
+                      'Dimensions': [
+                          {'Name': 'Rating', 'Value': rating},
+                          {'Name': 'Environment', 'Value': os.environ.get('ENVIRONMENT', 'dev')}
+                      ]
+                  }]
+                  
+                  cloudwatch.put_metric_data(
+                      Namespace='Phoenix/Business',
+                      MetricData=metrics
+                  )
+                  
+                  print(f"Sent feedback metric: {rating}")
+                  
+              except Exception as e:
+                  print(f"Failed to send feedback metrics: {e}")
+                  # Don't fail the main function if metrics fail
+          
+          def lambda_handler(event, context):
+              try:
+                  headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  }
+                  
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'OK'})
+                      }
+                  
+                  body = json.loads(event['body'])
+                  feedback_type = body.get('feedbackType')
+                  feedback_text = body.get('feedbackText', '')
+                  message_id = body.get('messageId', '')
+                  session_id = body.get('sessionId', '')
+                  message_content = body.get('messageContent', '')
+                  timestamp = body.get('timestamp', int(time.time()))
+                  user_email = body.get('userEmail', 'unknown@example.com')
+                  user_name = body.get('userName', 'Unknown User')
+                  
+                  feedback_id = str(uuid.uuid4())
+                  
+                  feedback_item = {
+                      'feedbackId': feedback_id,
+                      'timestamp': timestamp,
+                      'sessionId': session_id,
+                      'messageId': message_id,
+                      'feedbackText': feedback_text,
+                      'messageContent': message_content,
+                      'userEmail': user_email,
+                      'userName': user_name,
+                      'ttl': timestamp + (30 * 24 * 60 * 60)
+                  }
+                  
+                  if feedback_type == 'good':
+                      good_feedback_table.put_item(Item=feedback_item)
+                      send_feedback_metrics('good')
+                  elif feedback_type == 'bad':
+                      bad_feedback_table.put_item(Item=feedback_item)
+                      send_feedback_metrics('bad')
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Invalid feedback type'})
+                      }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Feedback submitted successfully',
+                          'feedbackId': feedback_id
+                      })
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+
+  # Lambda Function for Authentication API
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-auth-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+          USER_SESSIONS_TABLE: !Ref UserSessionsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          import hmac
+          import hashlib
+          import base64
+          from botocore.exceptions import ClientError
+          
+          cognito = boto3.client('cognito-idp')
+          dynamodb = boto3.resource('dynamodb')
+          user_sessions_table = dynamodb.Table(os.environ['USER_SESSIONS_TABLE'])
+          
+          USER_POOL_ID = os.environ['USER_POOL_ID']
+          CLIENT_ID = os.environ['CLIENT_ID']
+          
+          def lambda_handler(event, context):
+              try:
+                  headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                  }
+                  
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'OK'})
+                      }
+                  
+                  path = event.get('path', '')
+                  body = json.loads(event.get('body') or '{}')
+                  
+                  if path.endswith('/signup'):
+                      return handle_signup(body, headers)
+                  elif path.endswith('/login'):
+                      return handle_login(body, headers)
+                  elif path.endswith('/confirm'):
+                      return handle_confirm_signup(body, headers)
+                  elif path.endswith('/forgot-password'):
+                      return handle_forgot_password(body, headers)
+                  elif path.endswith('/reset-password'):
+                      return handle_reset_password(body, headers)
+                  elif path.endswith('/refresh'):
+                      return handle_refresh_token(body, headers)
+                  elif path.endswith('/user-info'):
+                      return handle_get_user_info(event, headers)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Endpoint not found'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+          
+          def handle_signup(body, headers):
+              try:
+                  email = body.get('email')
+                  password = body.get('password')
+                  first_name = body.get('firstName')
+                  last_name = body.get('lastName')
+                  
+                  if not all([email, password, first_name, last_name]):
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Missing required fields'})
+                      }
+                  
+                  response = cognito.sign_up(
+                      ClientId=CLIENT_ID,
+                      Username=email,
+                      Password=password,
+                      UserAttributes=[
+                          {'Name': 'email', 'Value': email},
+                          {'Name': 'given_name', 'Value': first_name},
+                          {'Name': 'family_name', 'Value': last_name}
+                      ]
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'User signed up successfully',
+                          'userSub': response.get('UserSub', ''),
+                          'codeDeliveryDetails': response.get('CodeDeliveryDetails', {})
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_login(body, headers):
+              try:
+                  email = body.get('email')
+                  password = body.get('password')
+                  
+                  if not all([email, password]):
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Email and password required'})
+                      }
+                  
+                  response = cognito.initiate_auth(
+                      ClientId=CLIENT_ID,
+                      AuthFlow='USER_PASSWORD_AUTH',
+                      AuthParameters={
+                          'USERNAME': email,
+                          'PASSWORD': password
+                      }
+                  )
+                  
+                  # Get user info
+                  user_info = cognito.get_user(
+                      AccessToken=response['AuthenticationResult']['AccessToken']
+                  )
+                  
+                  # Extract user_id from UserAttributes
+                  user_id = None
+                  for attr in user_info['UserAttributes']:
+                      if attr['Name'] == 'sub':
+                          user_id = attr['Value']
+                          break
+                  
+                  if not user_id:
+                      user_id = user_info.get('Username', '')
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Login successful',
+                          'accessToken': response['AuthenticationResult']['AccessToken'],
+                          'idToken': response['AuthenticationResult']['IdToken'],
+                          'refreshToken': response['AuthenticationResult']['RefreshToken'],
+                          'expiresIn': response['AuthenticationResult']['ExpiresIn'],
+                          'userId': user_id,
+                          'userAttributes': {attr['Name']: attr['Value'] for attr in user_info['UserAttributes']}
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_confirm_signup(body, headers):
+              try:
+                  email = body.get('email')
+                  confirmation_code = body.get('confirmationCode')
+                  
+                  if not all([email, confirmation_code]):
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Email and confirmation code required'})
+                      }
+                  
+                  cognito.confirm_sign_up(
+                      ClientId=CLIENT_ID,
+                      Username=email,
+                      ConfirmationCode=confirmation_code
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'Account confirmed successfully'})
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_forgot_password(body, headers):
+              try:
+                  email = body.get('email')
+                  
+                  if not email:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Email required'})
+                      }
+                  
+                  response = cognito.forgot_password(
+                      ClientId=CLIENT_ID,
+                      Username=email
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Password reset code sent',
+                          'codeDeliveryDetails': response.get('CodeDeliveryDetails', {})
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_reset_password(body, headers):
+              try:
+                  email = body.get('email')
+                  confirmation_code = body.get('confirmationCode')
+                  new_password = body.get('newPassword')
+                  
+                  if not all([email, confirmation_code, new_password]):
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Email, confirmation code, and new password required'})
+                      }
+                  
+                  cognito.confirm_forgot_password(
+                      ClientId=CLIENT_ID,
+                      Username=email,
+                      ConfirmationCode=confirmation_code,
+                      Password=new_password
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'Password reset successfully'})
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_refresh_token(body, headers):
+              try:
+                  refresh_token = body.get('refreshToken')
+                  
+                  if not refresh_token:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Refresh token required'})
+                      }
+                  
+                  response = cognito.initiate_auth(
+                      ClientId=CLIENT_ID,
+                      AuthFlow='REFRESH_TOKEN_AUTH',
+                      AuthParameters={
+                          'REFRESH_TOKEN': refresh_token
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Token refreshed successfully',
+                          'accessToken': response['AuthenticationResult']['AccessToken'],
+                          'idToken': response['AuthenticationResult']['IdToken'],
+                          'expiresIn': response['AuthenticationResult']['ExpiresIn']
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': error_message, 'code': error_code})
+                  }
+          
+          def handle_get_user_info(event, headers):
+              try:
+                  # API Gateway may use different case for headers
+                  event_headers = event.get('headers', {})
+                  auth_header = (event_headers.get('Authorization', '') or 
+                               event_headers.get('authorization', ''))
+                  if not auth_header.startswith('Bearer '):
+                      return {
+                          'statusCode': 401,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Invalid authorization header'})
+                      }
+                  
+                  access_token = auth_header.split(' ')[1]
+                  
+                  user_info = cognito.get_user(AccessToken=access_token)
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'userId': next((attr['Value'] for attr in user_info['UserAttributes'] if attr['Name'] == 'sub'), user_info.get('Username', '')),
+                          'username': user_info['Username'],
+                          'userAttributes': {attr['Name']: attr['Value'] for attr in user_info['UserAttributes']}
+                      })
+                  }
+                  
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  if error_code == 'NotAuthorizedException':
+                      return {
+                          'statusCode': 401,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Invalid or expired token'})
+                      }
+                  return {
+                      'statusCode': 400,
+                      'headers': headers,
+                      'body': json.dumps({'error': e.response['Error']['Message']})
+                  }
+
+  # Lambda Function for Chat History Management
+  ChatHistoryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'phoenix-chat-history-${Environment}-${AWS::StackName}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          CONVERSATION_TABLE: !Ref ConversationTable
+          USER_SESSIONS_TABLE: !Ref UserSessionsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import time
+          import os
+          from decimal import Decimal
+          from botocore.exceptions import ClientError
+          from datetime import datetime, timedelta
+          
+          dynamodb = boto3.resource('dynamodb')
+          cognito = boto3.client('cognito-idp')
+          conversation_table = dynamodb.Table(os.environ['CONVERSATION_TABLE'])
+          user_sessions_table = dynamodb.Table(os.environ['USER_SESSIONS_TABLE'])
+          
+          def lambda_handler(event, context):
+              try:
+                  headers = {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  }
+                  
+                  if event['httpMethod'] == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': headers,
+                          'body': json.dumps({'message': 'OK'})
+                      }
+                  
+                  # Extract user ID from JWT token
+                  user_id = get_user_id_from_token(event)
+                  if not user_id:
+                      return {
+                          'statusCode': 401,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Unauthorized'})
+                      }
+                  
+                  path = event.get('path', '')
+                  method = event.get('httpMethod', '')
+                  body = json.loads(event.get('body') or '{}')
+                  path_parameters = event.get('pathParameters') or {}
+                  query_parameters = event.get('queryStringParameters') or {}
+                  
+                  if path.endswith('/sessions') and method == 'GET':
+                      return get_user_sessions(user_id, query_parameters, headers)
+                  elif path.endswith('/sessions') and method == 'POST':
+                      return create_session(user_id, body, headers)
+                  elif '/sessions/' in path and method == 'GET':
+                      session_id = path_parameters.get('sessionId')
+                      return get_session_history(user_id, session_id, query_parameters, headers)
+                  elif '/sessions/' in path and method == 'PUT':
+                      session_id = path_parameters.get('sessionId')
+                      return update_session(user_id, session_id, body, headers)
+                  elif '/sessions/' in path and method == 'DELETE':
+                      session_id = path_parameters.get('sessionId')
+                      return delete_session(user_id, session_id, headers)
+                  elif path.endswith('/search') and method == 'GET':
+                      return search_conversations(user_id, query_parameters, headers)
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Endpoint not found'})
+                      }
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+          
+          def get_user_id_from_token(event):
+              try:
+                  # API Gateway may use different case for headers
+                  event_headers = event.get('headers', {})
+                  auth_header = (event_headers.get('Authorization', '') or 
+                               event_headers.get('authorization', ''))
+                  if not auth_header.startswith('Bearer '):
+                      return None
+                  
+                  access_token = auth_header.split(' ')[1]
+                  user_info = cognito.get_user(AccessToken=access_token)
+                  # Extract user_id from UserAttributes
+                  for attr in user_info.get('UserAttributes', []):
+                      if attr['Name'] == 'sub':
+                          return attr['Value']
+                  return user_info.get('Username', None)
+              except:
+                  return None
+          
+          def get_user_sessions(user_id, query_params, headers):
+              try:
+                  limit = int(query_params.get('limit', 50))
+                  
+                  # Query user sessions ordered by last activity
+                  response = user_sessions_table.query(
+                      IndexName='LastActivityIndex',
+                      KeyConditionExpression='userId = :userId',
+                      ExpressionAttributeValues={':userId': user_id},
+                      ScanIndexForward=False,  # Descending order
+                      Limit=limit
+                  )
+                  
+                  sessions = []
+                  now = datetime.now()
+                  
+                  for item in response.get('Items', []):
+                      last_activity = datetime.fromtimestamp(float(item['lastActivity']))
+                      
+                      # Categorize by time
+                      if last_activity.date() == now.date():
+                          category = 'today'
+                      elif last_activity.date() >= (now - timedelta(days=7)).date():
+                          category = 'thisWeek'
+                      else:
+                          category = 'older'
+                      
+                      sessions.append({
+                          'sessionId': item['sessionId'],
+                          'title': item.get('title', 'New Conversation'),
+                          'lastActivity': int(item['lastActivity']),
+                          'messageCount': item.get('messageCount', 0),
+                          'category': category,
+                          'preview': item.get('preview', '')
+                      })
+                  
+                  # Group by category
+                  grouped_sessions = {
+                      'today': [s for s in sessions if s['category'] == 'today'],
+                      'thisWeek': [s for s in sessions if s['category'] == 'thisWeek'],
+                      'older': [s for s in sessions if s['category'] == 'older']
+                  }
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'sessions': grouped_sessions,
+                          'total': len(sessions)
+                      }, default=decimal_default)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error getting user sessions: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to get sessions'})
+                  }
+          
+          def create_session(user_id, body, headers):
+              try:
+                  session_id = str(uuid.uuid4())
+                  title = body.get('title', 'New Conversation')
+                  timestamp = int(time.time())
+                  
+                  session_item = {
+                      'userId': user_id,
+                      'sessionId': session_id,
+                      'title': title,
+                      'lastActivity': timestamp,
+                      'messageCount': 0,
+                      'preview': '',
+                      'createdAt': timestamp,
+                      'ttl': timestamp + (365 * 24 * 60 * 60)  # 1 year TTL
+                  }
+                  
+                  user_sessions_table.put_item(Item=session_item)
+                  
+                  return {
+                      'statusCode': 201,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'message': 'Session created successfully',
+                          'sessionId': session_id,
+                          'session': session_item
+                      }, default=decimal_default)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error creating session: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to create session'})
+                  }
+          
+          def get_session_history(user_id, session_id, query_params, headers):
+              try:
+                  if not session_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session ID required'})
+                      }
+                  
+                  limit = int(query_params.get('limit', 100))
+                  
+                  # Query conversation history for this session
+                  response = conversation_table.query(
+                      KeyConditionExpression='sessionId = :sessionId',
+                      ExpressionAttributeValues={':sessionId': session_id},
+                      ScanIndexForward=True,  # Ascending order (chronological)
+                      Limit=limit
+                  )
+                  
+                  # Verify user owns this session
+                  session_response = user_sessions_table.get_item(
+                      Key={'userId': user_id, 'sessionId': session_id}
+                  )
+                  
+                  if 'Item' not in session_response:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session not found'})
+                      }
+                  
+                  messages = []
+                  for item in response.get('Items', []):
+                      # Only return messages for this user
+                      if item.get('userId') == user_id:
+                          messages.append({
+                              'messageId': item['messageId'],
+                              'content': item['content'],
+                              'role': item['role'],
+                              'timestamp': int(item['timestamp']),
+                              'ragEnabled': item.get('ragEnabled', False)
+                          })
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'sessionId': session_id,
+                          'messages': messages,
+                          'total': len(messages)
+                      }, default=decimal_default)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error getting session history: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to get session history'})
+                  }
+          
+          def update_session(user_id, session_id, body, headers):
+              try:
+                  if not session_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session ID required'})
+                      }
+                  
+                  # Verify user owns this session
+                  session_response = user_sessions_table.get_item(
+                      Key={'userId': user_id, 'sessionId': session_id}
+                  )
+                  
+                  if 'Item' not in session_response:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session not found'})
+                      }
+                  
+                  update_expressions = []
+                  expression_values = {}
+                  
+                  if 'title' in body:
+                      update_expressions.append('title = :title')
+                      expression_values[':title'] = body['title']
+                  
+                  if 'lastActivity' in body:
+                      update_expressions.append('lastActivity = :lastActivity')
+                      expression_values[':lastActivity'] = body['lastActivity']
+                  
+                  if 'messageCount' in body:
+                      update_expressions.append('messageCount = :messageCount')
+                      expression_values[':messageCount'] = body['messageCount']
+                  
+                  if 'preview' in body:
+                      update_expressions.append('preview = :preview')
+                      expression_values[':preview'] = body['preview']
+                  
+                  if update_expressions:
+                      user_sessions_table.update_item(
+                          Key={'userId': user_id, 'sessionId': session_id},
+                          UpdateExpression='SET ' + ', '.join(update_expressions),
+                          ExpressionAttributeValues=expression_values
+                      )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'Session updated successfully'})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error updating session: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to update session'})
+                  }
+          
+          def delete_session(user_id, session_id, headers):
+              try:
+                  if not session_id:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session ID required'})
+                      }
+                  
+                  # Verify user owns this session
+                  session_response = user_sessions_table.get_item(
+                      Key={'userId': user_id, 'sessionId': session_id}
+                  )
+                  
+                  if 'Item' not in session_response:
+                      return {
+                          'statusCode': 404,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Session not found'})
+                      }
+                  
+                  # Delete session
+                  user_sessions_table.delete_item(
+                      Key={'userId': user_id, 'sessionId': session_id}
+                  )
+                  
+                  # Delete all messages in this session
+                  messages_response = conversation_table.query(
+                      KeyConditionExpression='sessionId = :sessionId',
+                      ExpressionAttributeValues={':sessionId': session_id}
+                  )
+                  
+                  for item in messages_response.get('Items', []):
+                      if item.get('userId') == user_id:
+                          conversation_table.delete_item(
+                              Key={'sessionId': session_id, 'timestamp': item['timestamp']}
+                          )
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({'message': 'Session deleted successfully'})
+                  }
+                  
+              except Exception as e:
+                  print(f"Error deleting session: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to delete session'})
+                  }
+          
+          def search_conversations(user_id, query_params, headers):
+              try:
+                  search_query = query_params.get('q', '').lower()
+                  limit = int(query_params.get('limit', 50))
+                  
+                  if not search_query:
+                      return {
+                          'statusCode': 400,
+                          'headers': headers,
+                          'body': json.dumps({'error': 'Search query required'})
+                      }
+                  
+                  # Query user's conversations
+                  response = conversation_table.query(
+                      IndexName='UserIndex',
+                      KeyConditionExpression='userId = :userId',
+                      ExpressionAttributeValues={':userId': user_id},
+                      ScanIndexForward=False  # Most recent first
+                  )
+                  
+                  matching_messages = []
+                  session_titles = {}
+                  
+                  for item in response.get('Items', []):
+                      content = item.get('content', '').lower()
+                      if search_query in content:
+                          session_id = item['sessionId']
+                          
+                          # Get session title if not cached
+                          if session_id not in session_titles:
+                              session_response = user_sessions_table.get_item(
+                                  Key={'userId': user_id, 'sessionId': session_id}
+                              )
+                              session_titles[session_id] = session_response.get('Item', {}).get('title', 'Conversation')
+                          
+                          matching_messages.append({
+                              'messageId': item['messageId'],
+                              'sessionId': session_id,
+                              'sessionTitle': session_titles[session_id],
+                              'content': item['content'],
+                              'role': item['role'],
+                              'timestamp': int(item['timestamp']),
+                              'ragEnabled': item.get('ragEnabled', False)
+                          })
+                          
+                          if len(matching_messages) >= limit:
+                              break
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': headers,
+                      'body': json.dumps({
+                          'query': search_query,
+                          'matches': matching_messages,
+                          'total': len(matching_messages)
+                      }, default=decimal_default)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error searching conversations: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': headers,
+                      'body': json.dumps({'error': 'Failed to search conversations'})
+                  }
+          
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'phoenix-rag-api-${Environment}-${AWS::StackName}'
+      Description: 'Phoenix Chatbot API with RAG - UEL'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource for Chat
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'chat'
+
+  # API Gateway Resource for History
+  HistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'history'
+
+  # API Gateway Resource for Session History
+  SessionHistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref HistoryResource
+      PathPart: '{sessionId}'
+
+  # API Gateway Resource for Feedback
+  FeedbackResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'feedback'
+
+  # API Gateway Resource for Authentication
+  AuthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'auth'
+
+  # Auth Sub-resources
+  SignupResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'signup'
+
+  LoginResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'login'
+
+  ConfirmResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'confirm'
+
+  ForgotPasswordResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'forgot-password'
+
+  ResetPasswordResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'reset-password'
+
+  RefreshResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'refresh'
+
+  UserInfoResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref AuthResource
+      PathPart: 'user-info'
+
+  # API Gateway Resource for Chat History
+  ChatHistoryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'chat-history'
+
+  # Chat History Sub-resources
+  SessionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ChatHistoryResource
+      PathPart: 'sessions'
+
+  SessionDetailResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref SessionsResource
+      PathPart: '{sessionId}'
+
+  SearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ChatHistoryResource
+      PathPart: 'search'
+
+  # API Gateway Method for Chat POST
+  ChatMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ChatResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Method for Chat OPTIONS
+  ChatOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ChatResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway Method for History GET
+  HistoryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionHistoryResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Method for History OPTIONS
+  HistoryOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionHistoryResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway Method for Feedback POST
+  FeedbackMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref FeedbackResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FeedbackFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # API Gateway Method for Feedback OPTIONS
+  FeedbackOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref FeedbackResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Authentication API Methods
+  SignupMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SignupResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  LoginMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LoginResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  ConfirmMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ConfirmResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  ForgotPasswordMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ForgotPasswordResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  ResetPasswordMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ResetPasswordResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  RefreshMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RefreshResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  UserInfoMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref UserInfoResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # Chat History API Methods
+  SessionsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  SessionsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  SessionDetailGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionDetailResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  SessionDetailPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionDetailResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  SessionDetailDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionDetailResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  SearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SearchResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatHistoryFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+
+  # Chat History OPTIONS Methods for CORS
+  SessionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SessionDetailOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SessionDetailResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # OPTIONS Methods for CORS
+  SignupOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref SignupResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LoginOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LoginResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ConfirmOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ConfirmResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ForgotPasswordOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ForgotPasswordResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ResetPasswordOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ResetPasswordResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  RefreshOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RefreshResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UserInfoOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref UserInfoResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      Description: !Sub 'Deployment for ${AWS::StackName} - CORS Fix v2'
+    DependsOn:
+      - ChatMethod
+      - ChatOptionsMethod
+      - HistoryMethod
+      - HistoryOptionsMethod
+      - FeedbackMethod
+      - FeedbackOptionsMethod
+      - SignupMethod
+      - SignupOptionsMethod
+      - LoginMethod
+      - LoginOptionsMethod
+      - ConfirmMethod
+      - ConfirmOptionsMethod
+      - ForgotPasswordMethod
+      - ForgotPasswordOptionsMethod
+      - ResetPasswordMethod
+      - ResetPasswordOptionsMethod
+      - RefreshMethod
+      - RefreshOptionsMethod
+      - UserInfoMethod
+      - UserInfoOptionsMethod
+      - SessionsGetMethod
+      - SessionsPostMethod
+      - SessionsOptionsMethod
+      - SessionDetailGetMethod
+      - SessionDetailPutMethod
+      - SessionDetailDeleteMethod
+      - SessionDetailOptionsMethod
+      - SearchGetMethod
+      - SearchOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+
+  # Lambda Permissions for API Gateway
+  ChatLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  HistoryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HistoryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  FeedbackLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FeedbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  AuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  ChatHistoryLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatHistoryFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*'
+
+  # Custom Resource to trigger deployment
+  FrontendDeployment:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - FrontendBucket
+    Properties:
+      ServiceToken: !GetAtt DeploymentFunction.Arn
+      BucketName: !Ref FrontendBucket
+
+  # Phoenix Business Intelligence Dashboard
+  PhoenixBusinessDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'Phoenix-${Environment}-Business-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "TotalQueries", { "stat": "Sum" } ]
+                ],
+                "view": "singleValue",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Queries Today",
+                "period": 3600,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 6,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "TotalQueries" ]
+                ],
+                "view": "singleValue",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Total Queries",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "BedrockCost" ]
+                ],
+                "view": "singleValue",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Total Bedrock Cost (USD)",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18,
+              "y": 0,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "ActiveUsers" ]
+                ],
+                "view": "singleValue",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Active Users",
+                "period": 300,
+                "stat": "Maximum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "TokensUsed", "ModelType", "sonnet", "TokenType", "total" ],
+                  [ ".", ".", ".", "haiku", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "title": "Token Usage by Model",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "BedrockCost" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Bedrock Costs Over Time",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "QueriesPerHour" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Query Volume Over Time",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "Phoenix/Business", "TotalQueries" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Total Queries Over Time",
+                "period": 300,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  WebsiteURL:
+    Description: 'Phoenix Chatbot Website URL with RAG - UEL Branded'
+    Value: !If
+      - HasCustomDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebsiteURL'
+
+  KnowledgeBaseBucket:
+    Description: 'S3 bucket for Knowledge Base documents'
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseBucket'
+
+  BedrockKnowledgeBaseRole:
+    Description: 'IAM Role ARN for Bedrock Knowledge Base'
+    Value: !GetAtt BedrockKnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BedrockKnowledgeBaseRole'
+
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  S3BucketName:
+    Description: 'S3 bucket name for frontend hosting'
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3Bucket'
+
+  CloudFrontDistributionId:
+    Description: 'CloudFront Distribution ID'
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'
+
+  DynamoDBTableName:
+    Description: 'DynamoDB table name for conversations'
+    Value: !Ref ConversationTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+
+  GoodFeedbackTableName:
+    Description: 'DynamoDB table name for good feedback'
+    Value: !Ref GoodFeedbackTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GoodFeedbackTable'
+
+  BadFeedbackTableName:
+    Description: 'DynamoDB table name for bad feedback'
+    Value: !Ref BadFeedbackTable
+    Export:
+      Name: !Sub '${AWS::StackName}-BadFeedbackTable'
+
+  UserPoolId:
+    Description: 'Cognito User Pool ID'
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: 'Cognito User Pool Client ID'
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  IdentityPoolId:
+    Description: 'Cognito Identity Pool ID'
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub '${AWS::StackName}-IdentityPoolId'
+
+  AuthEndpoint:
+    Description: 'Authentication API endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/auth'
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthEndpoint'
+
+  UserSessionsTableName:
+    Description: 'DynamoDB table name for user sessions'
+    Value: !Ref UserSessionsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-UserSessionsTable'
+
+  ChatHistoryEndpoint:
+    Description: 'Chat History API endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/chat-history'
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatHistoryEndpoint'
+  
+  BusinessDashboardURL:
+    Description: 'Phoenix Business Intelligence Dashboard URL'
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=Phoenix-${Environment}-Business-Dashboard'
+    Export:
+      Name: !Sub '${AWS::StackName}-BusinessDashboard'
